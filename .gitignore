@@ -1,0 +1,7 @@
+drive-tsv-sync/
+  main.py
+  requirements.txt
+  Dockerfile
+  README.md
+  AGENTS.md
+  .gitignore
