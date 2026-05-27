@@ -1,5 +1,7 @@
 import io
+import csv
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -7,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from flask import Flask, jsonify
+import requests
 from google.cloud import storage
 from google.cloud import secretmanager
 from google.cloud import bigquery
@@ -15,9 +18,13 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 PROJECT_ID = os.environ["PROJECT_ID"]
 CONFIG_PATH = Path(os.environ.get("SYNC_TARGETS_CONFIG", "config/sync_targets.json"))
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+SLACK_WEBHOOK_SECRET = os.environ.get("SLACK_WEBHOOK_SECRET")
 
 GCS_BUCKET = "drive-tsv"
 
@@ -39,6 +46,13 @@ REQUIRED_TARGET_FIELDS = {
 
 
 @dataclass(frozen=True)
+class ValidationConfig:
+    mode: str
+    header_row_index: int
+    notify_on_invalid: bool
+
+
+@dataclass(frozen=True)
 class SyncTarget:
     name: str
     folder_id: str
@@ -50,6 +64,7 @@ class SyncTarget:
     bq_staging_table: str
     merge_keys: List[str]
     bq_schema: List[bigquery.SchemaField]
+    validation: ValidationConfig
 
     @property
     def bq_table_id(self) -> str:
@@ -78,6 +93,35 @@ def schema_field_from_config(field_config: Dict[str, Any]) -> bigquery.SchemaFie
 def normalize_gcs_prefix(gcs_prefix: str) -> str:
     prefix = gcs_prefix.strip("/")
     return f"{prefix}/" if prefix else ""
+
+
+def validation_config_from_target(target_config: Dict[str, Any]) -> ValidationConfig:
+    validation_config = target_config.get("validation", {})
+    if not isinstance(validation_config, dict):
+        raise ValueError(
+            f"Target '{target_config.get('name', target_config['bq_table'])}' "
+            "validation must be an object."
+        )
+
+    mode = validation_config.get("mode", "strict")
+    if mode not in {"strict", "disabled"}:
+        raise ValueError(
+            f"Target '{target_config.get('name', target_config['bq_table'])}' "
+            f"has unsupported validation mode: {mode}"
+        )
+
+    header_row_index = validation_config.get("header_row_index", 1)
+    if not isinstance(header_row_index, int) or header_row_index < 0:
+        raise ValueError(
+            f"Target '{target_config.get('name', target_config['bq_table'])}' "
+            "validation.header_row_index must be a non-negative integer."
+        )
+
+    return ValidationConfig(
+        mode=mode,
+        header_row_index=header_row_index,
+        notify_on_invalid=validation_config.get("notify_on_invalid", True),
+    )
 
 
 def load_sync_targets() -> List[SyncTarget]:
@@ -117,6 +161,7 @@ def load_sync_targets() -> List[SyncTarget]:
             re.compile(file_name_pattern)
 
         schema = [schema_field_from_config(field) for field in schema_config]
+        validation = validation_config_from_target(target_config)
         schema_columns = {field.name for field in schema}
         missing_merge_keys = set(merge_keys) - schema_columns
         if missing_merge_keys:
@@ -138,6 +183,7 @@ def load_sync_targets() -> List[SyncTarget]:
                 bq_staging_table=target_config["bq_staging_table"],
                 merge_keys=merge_keys,
                 bq_schema=schema,
+                validation=validation,
             )
         )
 
@@ -149,6 +195,20 @@ def get_secret(secret_id: str) -> str:
     name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
     response = client.access_secret_version(request={"name": name})
     return response.payload.data.decode("utf-8").strip()
+
+
+def get_slack_webhook_url() -> str | None:
+    if SLACK_WEBHOOK_URL:
+        return SLACK_WEBHOOK_URL
+
+    if not SLACK_WEBHOOK_SECRET:
+        return None
+
+    try:
+        return get_secret(SLACK_WEBHOOK_SECRET)
+    except Exception as e:
+        logger.error("SLACK_WEBHOOK_SECRET_ACCESS_FAILED secret=%s error=%s", SLACK_WEBHOOK_SECRET, e)
+        return None
 
 
 def get_drive_service():
@@ -256,6 +316,271 @@ def should_transfer(file_meta: Dict[str, Any], state: Dict[str, Any]) -> bool:
     )
 
 
+def decode_tsv_bytes(data: bytes) -> tuple[str, str]:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16"), "utf-16"
+
+    try:
+        return data.decode("utf-8-sig"), "utf-8-sig"
+    except UnicodeDecodeError:
+        return data.decode("utf-16"), "utf-16"
+
+
+def parse_tsv_row(row_text: str) -> List[str]:
+    return next(csv.reader([row_text], delimiter="\t", quotechar='"'))
+
+
+def schema_column_names(target: SyncTarget) -> List[str]:
+    return [field.name for field in target.bq_schema]
+
+
+def suggested_schema_patch(added_columns: List[str]) -> str | None:
+    if not added_columns:
+        return None
+
+    patch = [
+        {
+            "name": column,
+            "type": "STRING",
+        }
+        for column in added_columns
+    ]
+    return json.dumps(patch, ensure_ascii=False, indent=2)
+
+
+def classify_schema_drift(
+    expected_columns: List[str],
+    actual_columns: List[str],
+) -> tuple[str, List[str], List[str]]:
+    added_columns = [column for column in actual_columns if column not in expected_columns]
+    removed_columns = [column for column in expected_columns if column not in actual_columns]
+
+    if added_columns and not removed_columns:
+        return "columns_added", added_columns, removed_columns
+
+    if removed_columns and not added_columns:
+        return "columns_removed", added_columns, removed_columns
+
+    if not added_columns and not removed_columns:
+        return "column_order_changed", added_columns, removed_columns
+
+    return "columns_changed", added_columns, removed_columns
+
+
+def invalid_tsv_result(
+    file_meta: Dict[str, Any],
+    reason: str,
+    classification: str,
+    detail: str,
+    expected_columns: List[str] | None = None,
+    actual_columns: List[str] | None = None,
+    encoding: str | None = None,
+) -> Dict[str, Any]:
+    expected_columns = expected_columns or []
+    actual_columns = actual_columns or []
+    added_columns = []
+    removed_columns = []
+    if actual_columns:
+        _, added_columns, removed_columns = classify_schema_drift(
+            expected_columns,
+            actual_columns,
+        )
+
+    return {
+        "valid": False,
+        "name": file_meta.get("name"),
+        "id": file_meta.get("id"),
+        "reason": reason,
+        "classification": classification,
+        "detail": detail,
+        "encoding": encoding,
+        "expected_column_count": len(expected_columns),
+        "actual_column_count": len(actual_columns),
+        "added_columns": added_columns,
+        "removed_columns": removed_columns,
+        "suggested_schema_patch": suggested_schema_patch(added_columns),
+    }
+
+
+def validate_tsv_file(
+    target: SyncTarget,
+    file_meta: Dict[str, Any],
+    data: bytes,
+) -> Dict[str, Any]:
+    if target.validation.mode == "disabled":
+        return {"valid": True}
+
+    expected_columns = schema_column_names(target)
+
+    try:
+        text, encoding = decode_tsv_bytes(data)
+    except UnicodeDecodeError as e:
+        return invalid_tsv_result(
+            file_meta=file_meta,
+            reason="decode_error",
+            classification="decode_error",
+            detail=str(e),
+            expected_columns=expected_columns,
+        )
+
+    rows = text.splitlines()
+    header_row_index = target.validation.header_row_index
+    if len(rows) <= header_row_index:
+        return invalid_tsv_result(
+            file_meta=file_meta,
+            reason="header_missing",
+            classification="header_missing",
+            detail=f"Header row index {header_row_index} is outside TSV row range.",
+            expected_columns=expected_columns,
+            encoding=encoding,
+        )
+
+    try:
+        actual_columns = parse_tsv_row(rows[header_row_index])
+    except csv.Error as e:
+        return invalid_tsv_result(
+            file_meta=file_meta,
+            reason="tsv_parse_error",
+            classification="tsv_parse_error",
+            detail=str(e),
+            expected_columns=expected_columns,
+            encoding=encoding,
+        )
+
+    if actual_columns != expected_columns:
+        classification, added_columns, removed_columns = classify_schema_drift(
+            expected_columns,
+            actual_columns,
+        )
+        return {
+            "valid": False,
+            "name": file_meta.get("name"),
+            "id": file_meta.get("id"),
+            "reason": "schema_drift",
+            "classification": classification,
+            "detail": "TSV header columns do not match target bq_schema.",
+            "encoding": encoding,
+            "expected_column_count": len(expected_columns),
+            "actual_column_count": len(actual_columns),
+            "added_columns": added_columns,
+            "removed_columns": removed_columns,
+            "suggested_schema_patch": (
+                suggested_schema_patch(added_columns)
+                if classification == "columns_added"
+                else None
+            ),
+        }
+
+    missing_merge_keys = [
+        key
+        for key in target.merge_keys
+        if key not in actual_columns
+    ]
+    if missing_merge_keys:
+        return {
+            "valid": False,
+            "name": file_meta.get("name"),
+            "id": file_meta.get("id"),
+            "reason": "merge_key_missing",
+            "classification": "merge_key_missing",
+            "detail": "TSV header is missing merge key columns.",
+            "encoding": encoding,
+            "expected_column_count": len(expected_columns),
+            "actual_column_count": len(actual_columns),
+            "added_columns": [],
+            "removed_columns": missing_merge_keys,
+            "suggested_schema_patch": None,
+        }
+
+    return {
+        "valid": True,
+        "encoding": encoding,
+        "actual_column_count": len(actual_columns),
+    }
+
+
+def slack_message_for_invalid_tsv(target: SyncTarget, invalid_file: Dict[str, Any]) -> str:
+    lines = [
+        "TSV schema validation failed",
+        "",
+        f"target: {target.name}",
+        f"file: {invalid_file.get('name')}",
+        f"reason: {invalid_file.get('reason')}",
+        f"classification: {invalid_file.get('classification')}",
+        f"expected columns: {invalid_file.get('expected_column_count')}",
+        f"actual columns: {invalid_file.get('actual_column_count')}",
+    ]
+
+    added_columns = invalid_file.get("added_columns") or []
+    removed_columns = invalid_file.get("removed_columns") or []
+
+    if added_columns:
+        lines.extend([
+            "",
+            "Added columns:",
+            ", ".join(added_columns),
+        ])
+
+    if removed_columns:
+        lines.extend([
+            "",
+            "Removed columns:",
+            ", ".join(removed_columns),
+        ])
+
+    suggested_patch = invalid_file.get("suggested_schema_patch")
+    if suggested_patch:
+        lines.extend([
+            "",
+            "Suggested bq_schema addition:",
+            f"```{suggested_patch}```",
+        ])
+    elif removed_columns:
+        lines.extend([
+            "",
+            "Suggested action:",
+            "Reject this file by default. Restore the missing TSV columns, or make an explicit schema migration before allowing this format.",
+        ])
+
+    return "\n".join(lines)
+
+
+def notify_invalid_tsv(target: SyncTarget, invalid_file: Dict[str, Any]) -> None:
+    log_payload = {
+        "event": "TSV_SCHEMA_VALIDATION_FAILED",
+        "target": target.name,
+        **invalid_file,
+    }
+    logger.warning(json.dumps(log_payload, ensure_ascii=False, sort_keys=True))
+
+    if not target.validation.notify_on_invalid:
+        return
+
+    webhook_url = get_slack_webhook_url()
+    if not webhook_url:
+        logger.info(
+            "SLACK_NOTIFICATION_SKIPPED event=TSV_SCHEMA_VALIDATION_FAILED target=%s file=%s",
+            target.name,
+            invalid_file.get("name"),
+        )
+        return
+
+    try:
+        response = requests.post(
+            webhook_url,
+            json={"text": slack_message_for_invalid_tsv(target, invalid_file)},
+            timeout=10,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        logger.error(
+            "SLACK_NOTIFICATION_FAILED event=TSV_SCHEMA_VALIDATION_FAILED target=%s file=%s error=%s",
+            target.name,
+            invalid_file.get("name"),
+            e,
+        )
+
+
 def download_drive_file(drive_service, file_id: str) -> bytes:
     request = drive_service.files().get_media(
         fileId=file_id,
@@ -325,11 +650,7 @@ def load_latest_tsv_to_bq(bucket, target: SyncTarget) -> Dict[str, Any]:
 
     raw_bytes = latest_blob.download_as_bytes()
 
-    try:
-        text = raw_bytes.decode("utf-16")
-    except UnicodeDecodeError:
-        text = raw_bytes.decode("utf-8-sig")
-
+    text, _ = decode_tsv_bytes(raw_bytes)
     utf8_bytes = text.encode("utf-8")
 
     bq_client = bigquery.Client(project=PROJECT_ID)
@@ -430,6 +751,8 @@ def sync_target(drive_service, bucket, target: SyncTarget) -> Dict[str, Any]:
     transferred = []
     skipped = []
     failed = []
+    invalid = []
+    pending_state_updates = {}
     target_error = None
 
     for file_meta in files:
@@ -442,9 +765,15 @@ def sync_target(drive_service, bucket, target: SyncTarget) -> Dict[str, Any]:
                 continue
 
             data = download_drive_file(drive_service, file_id)
+            validation_result = validate_tsv_file(target, file_meta, data)
+            if not validation_result["valid"]:
+                invalid.append(validation_result)
+                notify_invalid_tsv(target, validation_result)
+                continue
+
             gcs_path = upload_to_gcs(bucket, target, file_name, data)
 
-            state[file_id] = {
+            pending_state_updates[file_id] = {
                 "name": file_name,
                 "md5Checksum": file_meta.get("md5Checksum"),
                 "modifiedTime": file_meta.get("modifiedTime"),
@@ -462,11 +791,10 @@ def sync_target(drive_service, bucket, target: SyncTarget) -> Dict[str, Any]:
             })
 
     if transferred:
-        save_state(bucket, target.state_blob, state)
-
-    if transferred:
         try:
             bq_result = load_latest_tsv_to_bq(bucket, target)
+            state.update(pending_state_updates)
+            save_state(bucket, target.state_blob, state)
         except Exception as e:
             target_error = f"BigQuery load failed: {e}"
             bq_result = {
@@ -489,8 +817,10 @@ def sync_target(drive_service, bucket, target: SyncTarget) -> Dict[str, Any]:
         "transferred": len(transferred),
         "skipped": len(skipped),
         "failed": len(failed),
+        "invalid": len(invalid),
         "transferred_files": transferred,
         "failed_files": failed,
+        "invalid_files": invalid,
         "bigquery": bq_result,
     }
 
@@ -532,6 +862,7 @@ def run_sync():
         ),
         "skipped": sum(target_result.get("skipped", 0) for target_result in target_results),
         "failed": sum(target_result.get("failed", 0) for target_result in target_results),
+        "invalid": sum(target_result.get("invalid", 0) for target_result in target_results),
     }
 
     result = {
@@ -545,6 +876,7 @@ def run_sync():
         target_result = target_results[0]
         result["transferred_files"] = target_result.get("transferred_files", [])
         result["failed_files"] = target_result.get("failed_files", [])
+        result["invalid_files"] = target_result.get("invalid_files", [])
         result["bigquery"] = target_result.get("bigquery", {
             "loaded": False,
             "error": target_result.get("error", "Target failed before BigQuery load."),

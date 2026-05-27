@@ -35,10 +35,29 @@ Each target supports:
 - `bq_dataset`: BigQuery dataset
 - `bq_table`: BigQuery merge target table
 - `bq_staging_table`: BigQuery staging table loaded from TSV
+- `validation`: TSV schema validation settings
 - `merge_keys`: Column names used in the BigQuery merge condition
 - `bq_schema`: BigQuery schema for this target
 
 The default `top_banner_tsv` target keeps the existing Drive folder, GCS prefix, state blob, BigQuery tables, merge key, and schema. It also filters Drive files with `^top_banner_tsv_download_\d{14}\.tsv$`.
+
+## TSV Validation
+
+Targets default to strict TSV validation. The service validates a downloaded TSV before uploading it to the normal GCS prefix.
+
+```json
+"validation": {
+  "mode": "strict",
+  "header_row_index": 1,
+  "notify_on_invalid": true
+}
+```
+
+In strict mode, the configured header row must match `bq_schema` exactly, including column order. Clear column additions and removals are classified as schema drift. Invalid files are excluded from GCS upload, BigQuery load, and successful state updates.
+
+Validation failures are written to Cloud Logging with event `TSV_SCHEMA_VALIDATION_FAILED`. If `SLACK_WEBHOOK_URL` is set, or `SLACK_WEBHOOK_SECRET` points to a Secret Manager secret containing a webhook URL, the service also posts a Slack notification with the detected diff and a suggested `bq_schema` addition for added columns.
+
+BigQuery state is saved only after the TSV is uploaded and the BigQuery load/merge succeeds. If BigQuery fails, the file remains retryable on the next run.
 
 ## Build
 

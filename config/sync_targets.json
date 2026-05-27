@@ -9,6 +9,11 @@
       "bq_dataset": "ice_magapocke_source",
       "bq_table": "top_banner_tsv",
       "bq_staging_table": "top_banner_tsv_stg",
+      "validation": {
+        "mode": "strict",
+        "header_row_index": 1,
+        "notify_on_invalid": true
+      },
       "merge_keys": [
         "id"
       ],
