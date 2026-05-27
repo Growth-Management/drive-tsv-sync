@@ -572,6 +572,11 @@ def notify_invalid_tsv(target: SyncTarget, invalid_file: Dict[str, Any]) -> None
             timeout=10,
         )
         response.raise_for_status()
+        logger.info(
+            "SLACK_NOTIFICATION_SENT event=TSV_SCHEMA_VALIDATION_FAILED target=%s file=%s",
+            target.name,
+            invalid_file.get("name"),
+        )
     except Exception as e:
         logger.error(
             "SLACK_NOTIFICATION_FAILED event=TSV_SCHEMA_VALIDATION_FAILED target=%s file=%s error=%s",
