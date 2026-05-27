@@ -2,7 +2,9 @@ import io
 import json
 import os
 import re
-from typing import Dict, Any
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List
 
 from flask import Flask, jsonify
 from google.cloud import storage
@@ -15,12 +17,9 @@ from googleapiclient.http import MediaIoBaseDownload
 app = Flask(__name__)
 
 PROJECT_ID = os.environ["PROJECT_ID"]
-
-FOLDER_ID = "1o5OHFPUxxzjSLg3JkDPHK_SbA6Q2Dl6q"
+CONFIG_PATH = Path(os.environ.get("SYNC_TARGETS_CONFIG", "config/sync_targets.json"))
 
 GCS_BUCKET = "drive-tsv"
-GCS_PREFIX = "drive-tsv/top_banner_tsv/"
-STATE_BLOB = "state/state.json"
 
 SECRET_CLIENT_ID = "drive-oauth-client-id"
 SECRET_CLIENT_SECRET = "drive-oauth-client-secret"
@@ -28,36 +27,115 @@ SECRET_REFRESH_TOKEN = "drive-oauth-refresh-token"
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-BQ_DATASET = "ice_magapocke_source"
-BQ_TABLE = "top_banner_tsv"
-BQ_STAGING_TABLE = "top_banner_tsv_stg"
+REQUIRED_TARGET_FIELDS = {
+    "folder_id",
+    "gcs_prefix",
+    "state_blob",
+    "bq_dataset",
+    "bq_table",
+    "bq_staging_table",
+    "merge_keys",
+}
 
-BQ_TABLE_ID = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
-BQ_STAGING_TABLE_ID = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_STAGING_TABLE}"
 
-BQ_SCHEMA = [
-    bigquery.SchemaField("command", "STRING"),
-    bigquery.SchemaField("start_time", "STRING"),
-    bigquery.SchemaField("finish_time", "STRING"),
-    bigquery.SchemaField("note", "STRING"),
-    bigquery.SchemaField("id", "STRING"),
-    bigquery.SchemaField("type", "STRING"),
-    bigquery.SchemaField("origin_image", "STRING"),
-    bigquery.SchemaField("url_scheme", "STRING"),
-    bigquery.SchemaField("alt_text", "STRING"),
-    bigquery.SchemaField("weight", "STRING"),
-    bigquery.SchemaField("platform", "STRING"),
-    bigquery.SchemaField("subscriber", "STRING"),
-    bigquery.SchemaField("target_user", "STRING"),
-    bigquery.SchemaField("target_account_ids_csv", "STRING"),
-    bigquery.SchemaField("purchaser", "STRING"),
-    bigquery.SchemaField("is_unpurchased_point", "STRING"),
-    bigquery.SchemaField("unpurchased_point_days", "STRING"),
-    bigquery.SchemaField("point_inequality", "STRING"),
-    bigquery.SchemaField("point", "STRING"),
-]
+@dataclass(frozen=True)
+class SyncTarget:
+    name: str
+    folder_id: str
+    gcs_prefix: str
+    state_blob: str
+    bq_dataset: str
+    bq_table: str
+    bq_staging_table: str
+    merge_keys: List[str]
+    bq_schema: List[bigquery.SchemaField]
 
-MERGE_KEYS = ["id"]
+    @property
+    def bq_table_id(self) -> str:
+        return f"{PROJECT_ID}.{self.bq_dataset}.{self.bq_table}"
+
+    @property
+    def bq_staging_table_id(self) -> str:
+        return f"{PROJECT_ID}.{self.bq_dataset}.{self.bq_staging_table}"
+
+
+def schema_field_from_config(field_config: Dict[str, Any]) -> bigquery.SchemaField:
+    field_name = field_config["name"]
+    field_type = field_config.get("type") or field_config.get("field_type")
+
+    if not field_type:
+        raise ValueError(f"BigQuery schema field '{field_name}' is missing type.")
+
+    return bigquery.SchemaField(
+        field_name,
+        field_type,
+        mode=field_config.get("mode", "NULLABLE"),
+        description=field_config.get("description"),
+    )
+
+
+def normalize_gcs_prefix(gcs_prefix: str) -> str:
+    prefix = gcs_prefix.strip("/")
+    return f"{prefix}/" if prefix else ""
+
+
+def load_sync_targets() -> List[SyncTarget]:
+    with CONFIG_PATH.open(encoding="utf-8") as config_file:
+        config = json.load(config_file)
+
+    target_configs = config.get("targets")
+    if not isinstance(target_configs, list) or not target_configs:
+        raise ValueError(f"{CONFIG_PATH} must contain a non-empty targets list.")
+
+    targets = []
+    for index, target_config in enumerate(target_configs):
+        if not isinstance(target_config, dict):
+            raise ValueError(f"Target at index {index} must be an object.")
+
+        missing = REQUIRED_TARGET_FIELDS - target_config.keys()
+        if missing:
+            missing_fields = ", ".join(sorted(missing))
+            raise ValueError(f"Target at index {index} is missing: {missing_fields}")
+
+        schema_config = target_config.get("bq_schema")
+        if not isinstance(schema_config, list) or not schema_config:
+            raise ValueError(
+                f"Target '{target_config.get('name', target_config['bq_table'])}' "
+                "must define a non-empty bq_schema."
+            )
+
+        merge_keys = target_config["merge_keys"]
+        if not isinstance(merge_keys, list) or not merge_keys:
+            raise ValueError(
+                f"Target '{target_config.get('name', target_config['bq_table'])}' "
+                "must define a non-empty merge_keys list."
+            )
+
+        schema = [schema_field_from_config(field) for field in schema_config]
+        schema_columns = {field.name for field in schema}
+        missing_merge_keys = set(merge_keys) - schema_columns
+        if missing_merge_keys:
+            missing_keys = ", ".join(sorted(missing_merge_keys))
+            raise ValueError(
+                f"Target '{target_config.get('name', target_config['bq_table'])}' "
+                f"has merge_keys not present in bq_schema: {missing_keys}"
+            )
+
+        targets.append(
+            SyncTarget(
+                name=target_config.get("name", target_config["bq_table"]),
+                folder_id=target_config["folder_id"],
+                gcs_prefix=normalize_gcs_prefix(target_config["gcs_prefix"]),
+                state_blob=target_config["state_blob"],
+                bq_dataset=target_config["bq_dataset"],
+                bq_table=target_config["bq_table"],
+                bq_staging_table=target_config["bq_staging_table"],
+                merge_keys=merge_keys,
+                bq_schema=schema,
+            )
+        )
+
+    return targets
 
 
 def get_secret(secret_id: str) -> str:
@@ -89,8 +167,8 @@ def get_storage_bucket():
     return client.bucket(GCS_BUCKET)
 
 
-def load_state(bucket) -> Dict[str, Any]:
-    blob = bucket.blob(STATE_BLOB)
+def load_state(bucket, state_blob: str) -> Dict[str, Any]:
+    blob = bucket.blob(state_blob)
 
     if not blob.exists():
         return {}
@@ -98,16 +176,16 @@ def load_state(bucket) -> Dict[str, Any]:
     return json.loads(blob.download_as_text(encoding="utf-8"))
 
 
-def save_state(bucket, state: Dict[str, Any]) -> None:
-    blob = bucket.blob(STATE_BLOB)
+def save_state(bucket, state_blob: str, state: Dict[str, Any]) -> None:
+    blob = bucket.blob(state_blob)
     blob.upload_from_string(
         json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
         content_type="application/json",
     )
 
 
-def list_tsv_files(drive_service):
-    query = f"'{FOLDER_ID}' in parents and name contains '.tsv' and trashed = false"
+def list_tsv_files(drive_service, folder_id: str):
+    query = f"'{folder_id}' in parents and name contains '.tsv' and trashed = false"
 
     files = []
     page_token = None
@@ -136,6 +214,10 @@ def list_tsv_files(drive_service):
             break
 
     return files
+
+
+def gcs_blob_path(target: SyncTarget, file_name: str) -> str:
+    return f"{target.gcs_prefix}{file_name}" if target.gcs_prefix else file_name
 
 
 def should_transfer(file_meta: Dict[str, Any], state: Dict[str, Any]) -> bool:
@@ -174,8 +256,8 @@ def download_drive_file(drive_service, file_id: str) -> bytes:
     return buffer.read()
 
 
-def upload_to_gcs(bucket, file_name: str, data: bytes) -> str:
-    blob_path = f"{GCS_PREFIX}{file_name}"
+def upload_to_gcs(bucket, target: SyncTarget, file_name: str, data: bytes) -> str:
+    blob_path = gcs_blob_path(target, file_name)
     blob = bucket.blob(blob_path)
 
     blob.upload_from_string(
@@ -191,8 +273,8 @@ def extract_file_timestamp(blob_name: str) -> str | None:
     return match.group(1) if match else None
 
 
-def find_latest_tsv_blob(bucket):
-    blobs = list(bucket.list_blobs(prefix=GCS_PREFIX))
+def find_latest_tsv_blob(bucket, target: SyncTarget):
+    blobs = list(bucket.list_blobs(prefix=target.gcs_prefix))
 
     candidates = []
     for blob in blobs:
@@ -206,19 +288,17 @@ def find_latest_tsv_blob(bucket):
     return max(candidates, key=lambda x: x[0])[1]
 
 
-def ensure_bq_tables(bq_client: bigquery.Client) -> None:
-    schema = BQ_SCHEMA
-
-    for table_id in [BQ_TABLE_ID, BQ_STAGING_TABLE_ID]:
-        table = bigquery.Table(table_id, schema=schema)
+def ensure_bq_tables(bq_client: bigquery.Client, target: SyncTarget) -> None:
+    for table_id in [target.bq_table_id, target.bq_staging_table_id]:
+        table = bigquery.Table(table_id, schema=target.bq_schema)
         try:
             bq_client.get_table(table_id)
         except Exception:
             bq_client.create_table(table)
 
 
-def load_latest_tsv_to_bq(bucket) -> Dict[str, Any]:
-    latest_blob = find_latest_tsv_blob(bucket)
+def load_latest_tsv_to_bq(bucket, target: SyncTarget) -> Dict[str, Any]:
+    latest_blob = find_latest_tsv_blob(bucket, target)
 
     if latest_blob is None:
         return {
@@ -236,13 +316,13 @@ def load_latest_tsv_to_bq(bucket) -> Dict[str, Any]:
     utf8_bytes = text.encode("utf-8")
 
     bq_client = bigquery.Client(project=PROJECT_ID)
-    ensure_bq_tables(bq_client)
+    ensure_bq_tables(bq_client, target)
 
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.CSV,
         field_delimiter="\t",
         skip_leading_rows=3,
-        schema=BQ_SCHEMA,
+        schema=target.bq_schema,
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         allow_quoted_newlines=True,
         encoding="UTF-8",
@@ -252,56 +332,67 @@ def load_latest_tsv_to_bq(bucket) -> Dict[str, Any]:
 
     load_job = bq_client.load_table_from_file(
         io.BytesIO(utf8_bytes),
-        BQ_STAGING_TABLE_ID,
+        target.bq_staging_table_id,
         job_config=job_config,
         rewind=True,
     )
     load_job.result()
 
-    merge_to_main_table(bq_client)
+    merge_to_main_table(bq_client, target)
 
     return {
         "loaded": True,
         "source_gcs": f"gs://{GCS_BUCKET}/{latest_blob.name}",
-        "staging_table": BQ_STAGING_TABLE_ID,
-        "target_table": BQ_TABLE_ID,
+        "staging_table": target.bq_staging_table_id,
+        "target_table": target.bq_table_id,
     }
 
 
-def merge_to_main_table(bq_client: bigquery.Client) -> None:
-    columns = [field.name for field in BQ_SCHEMA]
+def bq_column(column_name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column_name):
+        raise ValueError(f"Invalid BigQuery column name: {column_name}")
+    return f"`{column_name}`"
+
+
+def merge_to_main_table(bq_client: bigquery.Client, target: SyncTarget) -> None:
+    columns = [field.name for field in target.bq_schema]
 
     on_condition = " and ".join([
-        f"target.{key} = source.{key}"
-        for key in MERGE_KEYS
+        f"target.{bq_column(key)} = source.{bq_column(key)}"
+        for key in target.merge_keys
     ])
 
     update_columns = [
         col for col in columns
-        if col not in MERGE_KEYS
+        if col not in target.merge_keys
     ]
 
     update_set = "\n        , ".join([
-        f"{col} = source.{col}"
+        f"{bq_column(col)} = source.{bq_column(col)}"
         for col in update_columns
     ])
+    matched_clause = ""
+    if update_columns:
+        matched_clause = f"""
+when matched then
+    update set
+        {update_set}
+"""
 
-    insert_columns = "\n        , ".join(columns)
+    insert_columns = "\n        , ".join([bq_column(col) for col in columns])
     insert_values = "\n        , ".join([
-        f"source.{col}"
+        f"source.{bq_column(col)}"
         for col in columns
     ])
 
     sql = f"""
 merge
-    `{BQ_TABLE_ID}` as target
+    `{target.bq_table_id}` as target
 using
-    `{BQ_STAGING_TABLE_ID}` as source
+    `{target.bq_staging_table_id}` as source
 on
     {on_condition}
-when matched then
-    update set
-        {update_set}
+{matched_clause}
 when not matched then
     insert (
         {insert_columns}
@@ -315,17 +406,14 @@ when not matched then
     query_job.result()
 
 
-@app.route("/", methods=["GET", "POST"])
-def run_sync():
-    drive_service = get_drive_service()
-    bucket = get_storage_bucket()
-
-    state = load_state(bucket)
-    files = list_tsv_files(drive_service)
+def sync_target(drive_service, bucket, target: SyncTarget) -> Dict[str, Any]:
+    state = load_state(bucket, target.state_blob)
+    files = list_tsv_files(drive_service, target.folder_id)
 
     transferred = []
     skipped = []
     failed = []
+    target_error = None
 
     for file_meta in files:
         file_id = file_meta["id"]
@@ -337,7 +425,7 @@ def run_sync():
                 continue
 
             data = download_drive_file(drive_service, file_id)
-            gcs_path = upload_to_gcs(bucket, file_name, data)
+            gcs_path = upload_to_gcs(bucket, target, file_name, data)
 
             state[file_id] = {
                 "name": file_name,
@@ -357,10 +445,17 @@ def run_sync():
             })
 
     if transferred:
-        save_state(bucket, state)
+        save_state(bucket, target.state_blob, state)
 
     if transferred:
-        bq_result = load_latest_tsv_to_bq(bucket)
+        try:
+            bq_result = load_latest_tsv_to_bq(bucket, target)
+        except Exception as e:
+            target_error = f"BigQuery load failed: {e}"
+            bq_result = {
+                "loaded": False,
+                "error": str(e),
+            }
     else:
         bq_result = {
             "loaded": False,
@@ -368,6 +463,10 @@ def run_sync():
         }
 
     result = {
+        "target": target.name,
+        "folder_id": target.folder_id,
+        "gcs_prefix": target.gcs_prefix,
+        "state_blob": target.state_blob,
         "detected": len(files),
         "transferred": len(transferred),
         "skipped": len(skipped),
@@ -377,5 +476,61 @@ def run_sync():
         "bigquery": bq_result,
     }
 
-    status_code = 500 if failed else 200
+    if target_error:
+        result["error"] = target_error
+
+    return result
+
+
+@app.route("/", methods=["GET", "POST"])
+def run_sync():
+    drive_service = get_drive_service()
+    bucket = get_storage_bucket()
+    targets = load_sync_targets()
+
+    target_results = []
+
+    for target in targets:
+        try:
+            target_results.append(sync_target(drive_service, bucket, target))
+        except Exception as e:
+            target_results.append({
+                "target": target.name,
+                "folder_id": target.folder_id,
+                "error": str(e),
+            })
+
+    failed_targets = [
+        target_result
+        for target_result in target_results
+        if target_result.get("error") or target_result.get("failed", 0) > 0
+    ]
+
+    summary = {
+        "detected": sum(target_result.get("detected", 0) for target_result in target_results),
+        "transferred": sum(
+            target_result.get("transferred", 0)
+            for target_result in target_results
+        ),
+        "skipped": sum(target_result.get("skipped", 0) for target_result in target_results),
+        "failed": sum(target_result.get("failed", 0) for target_result in target_results),
+    }
+
+    result = {
+        **summary,
+        "targets": len(targets),
+        "failed_targets": len(failed_targets),
+        "results": target_results,
+    }
+
+    if len(target_results) == 1:
+        target_result = target_results[0]
+        result["transferred_files"] = target_result.get("transferred_files", [])
+        result["failed_files"] = target_result.get("failed_files", [])
+        result["bigquery"] = target_result.get("bigquery", {
+            "loaded": False,
+            "error": target_result.get("error", "Target failed before BigQuery load."),
+        })
+
+    status_code = 500 if failed_targets else 200
     return jsonify(result), status_code

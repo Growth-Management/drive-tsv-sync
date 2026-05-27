@@ -1,0 +1,94 @@
+{
+  "targets": [
+    {
+      "name": "top_banner_tsv",
+      "folder_id": "1o5OHFPUxxzjSLg3JkDPHK_SbA6Q2Dl6q",
+      "gcs_prefix": "drive-tsv/top_banner_tsv/",
+      "state_blob": "state/state.json",
+      "bq_dataset": "ice_magapocke_source",
+      "bq_table": "top_banner_tsv",
+      "bq_staging_table": "top_banner_tsv_stg",
+      "merge_keys": [
+        "id"
+      ],
+      "bq_schema": [
+        {
+          "name": "command",
+          "type": "STRING"
+        },
+        {
+          "name": "start_time",
+          "type": "STRING"
+        },
+        {
+          "name": "finish_time",
+          "type": "STRING"
+        },
+        {
+          "name": "note",
+          "type": "STRING"
+        },
+        {
+          "name": "id",
+          "type": "STRING"
+        },
+        {
+          "name": "type",
+          "type": "STRING"
+        },
+        {
+          "name": "origin_image",
+          "type": "STRING"
+        },
+        {
+          "name": "url_scheme",
+          "type": "STRING"
+        },
+        {
+          "name": "alt_text",
+          "type": "STRING"
+        },
+        {
+          "name": "weight",
+          "type": "STRING"
+        },
+        {
+          "name": "platform",
+          "type": "STRING"
+        },
+        {
+          "name": "subscriber",
+          "type": "STRING"
+        },
+        {
+          "name": "target_user",
+          "type": "STRING"
+        },
+        {
+          "name": "target_account_ids_csv",
+          "type": "STRING"
+        },
+        {
+          "name": "purchaser",
+          "type": "STRING"
+        },
+        {
+          "name": "is_unpurchased_point",
+          "type": "STRING"
+        },
+        {
+          "name": "unpurchased_point_days",
+          "type": "STRING"
+        },
+        {
+          "name": "point_inequality",
+          "type": "STRING"
+        },
+        {
+          "name": "point",
+          "type": "STRING"
+        }
+      ]
+    }
+  ]
+}
