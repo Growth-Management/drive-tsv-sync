@@ -29,6 +29,7 @@ Each target supports:
 
 - `name`: Optional display name used in responses
 - `folder_id`: Google Drive folder ID
+- `file_name_pattern`: Optional regular expression for selecting files in the folder
 - `gcs_prefix`: GCS prefix where TSV files are uploaded
 - `state_blob`: GCS blob path for the per-target sync state JSON
 - `bq_dataset`: BigQuery dataset
@@ -37,7 +38,7 @@ Each target supports:
 - `merge_keys`: Column names used in the BigQuery merge condition
 - `bq_schema`: BigQuery schema for this target
 
-The default `top_banner_tsv` target keeps the existing Drive folder, GCS prefix, state blob, BigQuery tables, merge key, and schema.
+The default `top_banner_tsv` target keeps the existing Drive folder, GCS prefix, state blob, BigQuery tables, merge key, and schema. It also filters Drive files with `^top_banner_tsv_download_\d{14}\.tsv$`.
 
 ## Build
 

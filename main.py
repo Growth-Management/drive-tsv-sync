@@ -42,6 +42,7 @@ REQUIRED_TARGET_FIELDS = {
 class SyncTarget:
     name: str
     folder_id: str
+    file_name_pattern: str | None
     gcs_prefix: str
     state_blob: str
     bq_dataset: str
@@ -111,6 +112,10 @@ def load_sync_targets() -> List[SyncTarget]:
                 "must define a non-empty merge_keys list."
             )
 
+        file_name_pattern = target_config.get("file_name_pattern")
+        if file_name_pattern is not None:
+            re.compile(file_name_pattern)
+
         schema = [schema_field_from_config(field) for field in schema_config]
         schema_columns = {field.name for field in schema}
         missing_merge_keys = set(merge_keys) - schema_columns
@@ -125,6 +130,7 @@ def load_sync_targets() -> List[SyncTarget]:
             SyncTarget(
                 name=target_config.get("name", target_config["bq_table"]),
                 folder_id=target_config["folder_id"],
+                file_name_pattern=file_name_pattern,
                 gcs_prefix=normalize_gcs_prefix(target_config["gcs_prefix"]),
                 state_blob=target_config["state_blob"],
                 bq_dataset=target_config["bq_dataset"],
@@ -184,8 +190,15 @@ def save_state(bucket, state_blob: str, state: Dict[str, Any]) -> None:
     )
 
 
-def list_tsv_files(drive_service, folder_id: str):
-    query = f"'{folder_id}' in parents and name contains '.tsv' and trashed = false"
+def matches_target_file(target: SyncTarget, file_name: str) -> bool:
+    if not target.file_name_pattern:
+        return True
+
+    return re.search(target.file_name_pattern, file_name) is not None
+
+
+def list_tsv_files(drive_service, target: SyncTarget):
+    query = f"'{target.folder_id}' in parents and name contains '.tsv' and trashed = false"
 
     files = []
     page_token = None
@@ -213,7 +226,11 @@ def list_tsv_files(drive_service, folder_id: str):
         if not page_token:
             break
 
-    return files
+    return [
+        file_meta
+        for file_meta in files
+        if matches_target_file(target, file_meta["name"])
+    ]
 
 
 def gcs_blob_path(target: SyncTarget, file_name: str) -> str:
@@ -408,7 +425,7 @@ when not matched then
 
 def sync_target(drive_service, bucket, target: SyncTarget) -> Dict[str, Any]:
     state = load_state(bucket, target.state_blob)
-    files = list_tsv_files(drive_service, target.folder_id)
+    files = list_tsv_files(drive_service, target)
 
     transferred = []
     skipped = []
@@ -465,6 +482,7 @@ def sync_target(drive_service, bucket, target: SyncTarget) -> Dict[str, Any]:
     result = {
         "target": target.name,
         "folder_id": target.folder_id,
+        "file_name_pattern": target.file_name_pattern,
         "gcs_prefix": target.gcs_prefix,
         "state_blob": target.state_blob,
         "detected": len(files),

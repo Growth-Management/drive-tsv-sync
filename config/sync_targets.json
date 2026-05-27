@@ -3,6 +3,7 @@
     {
       "name": "top_banner_tsv",
       "folder_id": "1o5OHFPUxxzjSLg3JkDPHK_SbA6Q2Dl6q",
+      "file_name_pattern": "^top_banner_tsv_download_\\d{14}\\.tsv$",
       "gcs_prefix": "drive-tsv/top_banner_tsv/",
       "state_blob": "state/state.json",
       "bq_dataset": "ice_magapocke_source",
