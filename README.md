@@ -1,12 +1,16 @@
 # Drive TSV Sync
 
-Cloud Run service that syncs TSV files from Google Drive to GCS, loads the latest TSV into a BigQuery staging table, and merges it into the target table.
+Cloud Run service that syncs the latest timestamped TSV file from Google Drive to
+GCS, loads it into a BigQuery staging table, and replaces the target table from
+that staging snapshot.
 
 ## Flow
 
-Cloud Scheduler -> Cloud Run -> Google Drive -> GCS -> BigQuery staging -> BigQuery target
+Cloud Scheduler -> Cloud Run -> Google Drive -> GCS -> BigQuery staging ->
+BigQuery target
 
-Cloud Run must stay authenticated. The OAuth Secret Manager secret names are fixed and remain unchanged:
+Cloud Run must stay authenticated. The OAuth Secret Manager secret names are
+fixed and remain unchanged:
 
 - `drive-oauth-client-id`
 - `drive-oauth-client-secret`
@@ -21,29 +25,59 @@ Cloud Run must stay authenticated. The OAuth Secret Manager secret names are fix
 - Scheduler SA: `drive-tsv-scheduler@ice-magapocke-project.iam.gserviceaccount.com`
 - Container image: `gcr.io/ice-magapocke-project/drive-tsv-sync`
 
+## Deploy
+
+Deploys are handled by `.github/workflows/deploy-cloud-run.yml`.
+
+The workflow runs on:
+
+- pushes to `main`
+- manual `workflow_dispatch`
+
+Required GitHub Secrets:
+
+- `GCP_WORKLOAD_IDENTITY_PROVIDER`: Workload Identity Provider resource name
+- `GCP_SERVICE_ACCOUNT`: deploy service account email used by GitHub Actions
+
+The deploy service account needs permissions to:
+
+- build and push the container image with Cloud Build / Container Registry
+- deploy `drive-tsv-sync` to Cloud Run
+- act as `drive-tsv-runner@ice-magapocke-project.iam.gserviceaccount.com`
+
+The workflow uses immutable image tags based on `${{ github.sha }}` and keeps
+Cloud Run authentication required. It does not add public access.
+
+For agent-driven deploys, run the `Deploy Cloud Run` GitHub Actions workflow on
+`main`, then inspect the workflow run and the final `Verify deployed revision`
+step. The verification step prints the latest ready revision and service URL.
+
 ## Sync Targets
 
-Sync targets are defined in `config/sync_targets.json`. The Cloud Run service processes the `targets` array in order.
+Sync targets are defined in `config/sync_targets.json`. The Cloud Run service
+processes the `targets` array in order.
 
 Each target supports:
 
 - `name`: Optional display name used in responses
 - `folder_id`: Google Drive folder ID
 - `file_name_pattern`: Optional regular expression for selecting files in the folder
-- `gcs_prefix`: GCS prefix where TSV files are uploaded
+- `gcs_prefix`: GCS prefix where valid TSV files are uploaded
 - `state_blob`: GCS blob path for the per-target sync state JSON
 - `bq_dataset`: BigQuery dataset
-- `bq_table`: BigQuery merge target table
+- `bq_table`: BigQuery snapshot target table
 - `bq_staging_table`: BigQuery staging table loaded from TSV
 - `validation`: TSV schema validation settings
-- `merge_keys`: Column names used in the BigQuery merge condition
 - `bq_schema`: BigQuery schema for this target
 
-The default `top_banner_tsv` target keeps the existing Drive folder, GCS prefix, state blob, BigQuery tables, merge key, and schema. It also filters Drive files with `^top_banner_tsv_download_\d{14}\.tsv$`.
+The default `top_banner_tsv` target filters Drive files with
+`^top_banner_tsv_download_\d{14}\.tsv$`. The timestamp in the file name selects
+the latest Drive file to process.
 
 ## TSV Validation
 
-Targets default to strict TSV validation. The service validates a downloaded TSV before uploading it to the normal GCS prefix.
+Targets default to strict TSV validation. The service validates a downloaded TSV
+before uploading it to the normal GCS prefix.
 
 ```json
 "validation": {
@@ -53,18 +87,19 @@ Targets default to strict TSV validation. The service validates a downloaded TSV
 }
 ```
 
-In strict mode, the configured header row must match `bq_schema` exactly, including column order. Clear column additions and removals are classified as schema drift. Invalid files are excluded from GCS upload, BigQuery load, and successful state updates.
+In strict mode, the configured header row must match `bq_schema` exactly,
+including column order. Clear column additions and removals are classified as
+schema drift. Invalid files are excluded from the normal GCS prefix, BigQuery
+load, and successful state updates.
 
-Validation failures are written to Cloud Logging with event `TSV_SCHEMA_VALIDATION_FAILED`. If `SLACK_WEBHOOK_URL` is set, or `SLACK_WEBHOOK_SECRET` points to a Secret Manager secret containing a webhook URL, the service also posts a Slack notification with the detected diff and a suggested `bq_schema` addition for added columns.
+Validation failures are written to Cloud Logging with event
+`TSV_SCHEMA_VALIDATION_FAILED`. If `SLACK_WEBHOOK_URL` is set, or
+`SLACK_WEBHOOK_SECRET` points to a Secret Manager secret containing a webhook
+URL, the service also posts a Slack notification with the detected diff and a
+suggested `bq_schema` addition for added columns.
 
-BigQuery state is saved only after the TSV is uploaded and the BigQuery load/merge succeeds. If BigQuery fails, the file remains retryable on the next run.
-
-## Build
-
-```bat
-gcloud builds submit --tag gcr.io/ice-magapocke-project/drive-tsv-sync
-```
-
-## Deploy
-
-Keep Cloud Run authentication required. `config/sync_targets.json` is copied into the Docker image.
+Invalid TSV files are stored under `invalid/top_banner_tsv/` with their
+validation result JSON. BigQuery state is saved to `last_success` only after the
+TSV is uploaded, staging is loaded, and the target table replacement succeeds.
+If validation or BigQuery fails, `last_success` remains unchanged and the latest
+file remains retryable on the next run.

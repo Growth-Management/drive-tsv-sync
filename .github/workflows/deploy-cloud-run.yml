@@ -1,0 +1,62 @@
+name: Deploy Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-cloud-run-main
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ice-magapocke-project
+  REGION: asia-northeast1
+  SERVICE: drive-tsv-sync
+  IMAGE_BASE: gcr.io/ice-magapocke-project/drive-tsv-sync
+  RUNTIME_SERVICE_ACCOUNT: drive-tsv-runner@ice-magapocke-project.iam.gserviceaccount.com
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build image
+        run: |
+          gcloud builds submit \
+            --project "${PROJECT_ID}" \
+            --tag "${IMAGE_BASE}:${GITHUB_SHA}"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --image "${IMAGE_BASE}:${GITHUB_SHA}" \
+            --service-account "${RUNTIME_SERVICE_ACCOUNT}" \
+            --quiet
+
+      - name: Verify deployed revision
+        run: |
+          gcloud run services describe "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --format='value(status.latestReadyRevisionName,status.url)'
