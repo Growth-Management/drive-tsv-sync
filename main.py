@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
@@ -27,6 +28,7 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 SLACK_WEBHOOK_SECRET = os.environ.get("SLACK_WEBHOOK_SECRET")
 
 GCS_BUCKET = "drive-tsv"
+INVALID_GCS_PREFIX = "invalid"
 
 SECRET_CLIENT_ID = "drive-oauth-client-id"
 SECRET_CLIENT_SECRET = "drive-oauth-client-secret"
@@ -41,7 +43,6 @@ REQUIRED_TARGET_FIELDS = {
     "bq_dataset",
     "bq_table",
     "bq_staging_table",
-    "merge_keys",
 }
 
 
@@ -62,7 +63,6 @@ class SyncTarget:
     bq_dataset: str
     bq_table: str
     bq_staging_table: str
-    merge_keys: List[str]
     bq_schema: List[bigquery.SchemaField]
     validation: ValidationConfig
 
@@ -73,6 +73,14 @@ class SyncTarget:
     @property
     def bq_staging_table_id(self) -> str:
         return f"{PROJECT_ID}.{self.bq_dataset}.{self.bq_staging_table}"
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def log_structured(event: str, **payload: Any) -> None:
+    logger.info(json.dumps({"event": event, **payload}, ensure_ascii=False, sort_keys=True))
 
 
 def schema_field_from_config(field_config: Dict[str, Any]) -> bigquery.SchemaField:
@@ -149,27 +157,12 @@ def load_sync_targets() -> List[SyncTarget]:
                 "must define a non-empty bq_schema."
             )
 
-        merge_keys = target_config["merge_keys"]
-        if not isinstance(merge_keys, list) or not merge_keys:
-            raise ValueError(
-                f"Target '{target_config.get('name', target_config['bq_table'])}' "
-                "must define a non-empty merge_keys list."
-            )
-
         file_name_pattern = target_config.get("file_name_pattern")
         if file_name_pattern is not None:
             re.compile(file_name_pattern)
 
         schema = [schema_field_from_config(field) for field in schema_config]
         validation = validation_config_from_target(target_config)
-        schema_columns = {field.name for field in schema}
-        missing_merge_keys = set(merge_keys) - schema_columns
-        if missing_merge_keys:
-            missing_keys = ", ".join(sorted(missing_merge_keys))
-            raise ValueError(
-                f"Target '{target_config.get('name', target_config['bq_table'])}' "
-                f"has merge_keys not present in bq_schema: {missing_keys}"
-            )
 
         targets.append(
             SyncTarget(
@@ -181,7 +174,6 @@ def load_sync_targets() -> List[SyncTarget]:
                 bq_dataset=target_config["bq_dataset"],
                 bq_table=target_config["bq_table"],
                 bq_staging_table=target_config["bq_staging_table"],
-                merge_keys=merge_keys,
                 bq_schema=schema,
                 validation=validation,
             )
@@ -297,23 +289,82 @@ def gcs_blob_path(target: SyncTarget, file_name: str) -> str:
     return f"{target.gcs_prefix}{file_name}" if target.gcs_prefix else file_name
 
 
-def should_transfer(file_meta: Dict[str, Any], state: Dict[str, Any]) -> bool:
-    file_id = file_meta["id"]
-    previous = state.get(file_id)
+def extract_file_timestamp(file_name: str) -> str | None:
+    match = re.search(r"_(\d{14})\.tsv$", file_name)
+    return match.group(1) if match else None
 
-    if previous is None:
-        return True
 
-    current_md5 = file_meta.get("md5Checksum")
-    previous_md5 = previous.get("md5Checksum")
+def select_latest_drive_file(files: List[Dict[str, Any]]) -> tuple[Dict[str, Any], str] | tuple[None, None]:
+    candidates = []
+    for file_meta in files:
+        file_timestamp = extract_file_timestamp(file_meta["name"])
+        if file_timestamp:
+            candidates.append((file_timestamp, file_meta))
 
-    if current_md5 and previous_md5:
-        return current_md5 != previous_md5
+    if not candidates:
+        return None, None
+
+    file_timestamp, file_meta = max(candidates, key=lambda candidate: candidate[0])
+    return file_meta, file_timestamp
+
+
+def last_success_matches(
+    file_meta: Dict[str, Any],
+    file_timestamp: str,
+    state: Dict[str, Any],
+) -> bool:
+    last_success = state.get("last_success") or {}
 
     return (
-        file_meta.get("modifiedTime") != previous.get("modifiedTime")
-        or file_meta.get("size") != previous.get("size")
+        last_success.get("drive_file_id") == file_meta.get("id")
+        and last_success.get("file_name") == file_meta.get("name")
+        and last_success.get("file_timestamp") == file_timestamp
+        and last_success.get("md5_checksum") == file_meta.get("md5Checksum")
+        and last_success.get("modified_time") == file_meta.get("modifiedTime")
+        and last_success.get("size") == file_meta.get("size")
     )
+
+
+def file_state_payload(
+    file_meta: Dict[str, Any],
+    file_timestamp: str,
+    gcs_path: str | None = None,
+    loaded_at: str | None = None,
+) -> Dict[str, Any]:
+    payload = {
+        "drive_file_id": file_meta.get("id"),
+        "file_name": file_meta.get("name"),
+        "file_timestamp": file_timestamp,
+        "md5_checksum": file_meta.get("md5Checksum"),
+        "modified_time": file_meta.get("modifiedTime"),
+        "size": file_meta.get("size"),
+    }
+
+    if gcs_path is not None:
+        payload["gcs_path"] = gcs_path
+
+    if loaded_at is not None:
+        payload["loaded_at"] = loaded_at
+
+    return payload
+
+
+def attempt_payload(
+    status: str,
+    file_meta: Dict[str, Any] | None = None,
+    file_timestamp: str | None = None,
+    **extra: Any,
+) -> Dict[str, Any]:
+    payload = {
+        "status": status,
+        "attempted_at": utc_now_iso(),
+    }
+
+    if file_meta and file_timestamp:
+        payload.update(file_state_payload(file_meta, file_timestamp))
+
+    payload.update(extra)
+    return payload
 
 
 def decode_tsv_bytes(data: bytes) -> tuple[str, str]:
@@ -471,27 +522,6 @@ def validate_tsv_file(
             ),
         }
 
-    missing_merge_keys = [
-        key
-        for key in target.merge_keys
-        if key not in actual_columns
-    ]
-    if missing_merge_keys:
-        return {
-            "valid": False,
-            "name": file_meta.get("name"),
-            "id": file_meta.get("id"),
-            "reason": "merge_key_missing",
-            "classification": "merge_key_missing",
-            "detail": "TSV header is missing merge key columns.",
-            "encoding": encoding,
-            "expected_column_count": len(expected_columns),
-            "actual_column_count": len(actual_columns),
-            "added_columns": [],
-            "removed_columns": missing_merge_keys,
-            "suggested_schema_patch": None,
-        }
-
     return {
         "valid": True,
         "encoding": encoding,
@@ -612,27 +642,42 @@ def upload_to_gcs(bucket, target: SyncTarget, file_name: str, data: bytes) -> st
         content_type="text/tab-separated-values",
     )
 
+    log_structured(
+        "GCS_UPLOAD_SUCCEEDED",
+        target=target.name,
+        file_name=file_name,
+        gcs_path=f"gs://{GCS_BUCKET}/{blob_path}",
+    )
     return blob_path
 
 
-def extract_file_timestamp(blob_name: str) -> str | None:
-    match = re.search(r"_(\d{14})\.tsv$", blob_name)
-    return match.group(1) if match else None
+def invalid_gcs_blob_path(target: SyncTarget, file_name: str) -> str:
+    return f"{INVALID_GCS_PREFIX}/{target.name}/{file_name}"
 
 
-def find_latest_tsv_blob(bucket, target: SyncTarget):
-    blobs = list(bucket.list_blobs(prefix=target.gcs_prefix))
+def upload_invalid_tsv(
+    bucket,
+    target: SyncTarget,
+    file_name: str,
+    data: bytes,
+    validation_result: Dict[str, Any],
+) -> Dict[str, str]:
+    tsv_blob_path = invalid_gcs_blob_path(target, file_name)
+    result_blob_path = f"{tsv_blob_path}.validation.json"
 
-    candidates = []
-    for blob in blobs:
-        ts = extract_file_timestamp(blob.name)
-        if ts:
-            candidates.append((ts, blob))
+    bucket.blob(tsv_blob_path).upload_from_string(
+        data,
+        content_type="text/tab-separated-values",
+    )
+    bucket.blob(result_blob_path).upload_from_string(
+        json.dumps(validation_result, ensure_ascii=False, indent=2, sort_keys=True),
+        content_type="application/json",
+    )
 
-    if not candidates:
-        return None
-
-    return max(candidates, key=lambda x: x[0])[1]
+    return {
+        "invalid_gcs_path": f"gs://{GCS_BUCKET}/{tsv_blob_path}",
+        "validation_gcs_path": f"gs://{GCS_BUCKET}/{result_blob_path}",
+    }
 
 
 def ensure_bq_tables(bq_client: bigquery.Client, target: SyncTarget) -> None:
@@ -644,18 +689,12 @@ def ensure_bq_tables(bq_client: bigquery.Client, target: SyncTarget) -> None:
             bq_client.create_table(table)
 
 
-def load_latest_tsv_to_bq(bucket, target: SyncTarget) -> Dict[str, Any]:
-    latest_blob = find_latest_tsv_blob(bucket, target)
-
-    if latest_blob is None:
-        return {
-            "loaded": False,
-            "reason": "No TSV files found in GCS prefix.",
-        }
-
-    raw_bytes = latest_blob.download_as_bytes()
-
-    text, _ = decode_tsv_bytes(raw_bytes)
+def load_tsv_to_bq(
+    target: SyncTarget,
+    data: bytes,
+    source_gcs_path: str,
+) -> Dict[str, Any]:
+    text, _ = decode_tsv_bytes(data)
     utf8_bytes = text.encode("utf-8")
 
     bq_client = bigquery.Client(project=PROJECT_ID)
@@ -681,11 +720,11 @@ def load_latest_tsv_to_bq(bucket, target: SyncTarget) -> Dict[str, Any]:
     )
     load_job.result()
 
-    merge_to_main_table(bq_client, target)
+    replace_main_table(bq_client, target)
 
     return {
         "loaded": True,
-        "source_gcs": f"gs://{GCS_BUCKET}/{latest_blob.name}",
+        "source_gcs": source_gcs_path,
         "staging_table": target.bq_staging_table_id,
         "target_table": target.bq_table_id,
     }
@@ -697,52 +736,20 @@ def bq_column(column_name: str) -> str:
     return f"`{column_name}`"
 
 
-def merge_to_main_table(bq_client: bigquery.Client, target: SyncTarget) -> None:
-    columns = [field.name for field in target.bq_schema]
-
-    on_condition = " and ".join([
-        f"target.{bq_column(key)} = source.{bq_column(key)}"
-        for key in target.merge_keys
-    ])
-
-    update_columns = [
-        col for col in columns
-        if col not in target.merge_keys
-    ]
-
-    update_set = "\n        , ".join([
-        f"{bq_column(col)} = source.{bq_column(col)}"
-        for col in update_columns
-    ])
-    matched_clause = ""
-    if update_columns:
-        matched_clause = f"""
-when matched then
-    update set
-        {update_set}
-"""
-
-    insert_columns = "\n        , ".join([bq_column(col) for col in columns])
-    insert_values = "\n        , ".join([
-        f"source.{bq_column(col)}"
-        for col in columns
-    ])
+def replace_main_table(bq_client: bigquery.Client, target: SyncTarget) -> None:
+    select_columns = "\n        , ".join(
+        bq_column(field.name)
+        for field in target.bq_schema
+    )
 
     sql = f"""
-merge
-    `{target.bq_table_id}` as target
-using
-    `{target.bq_staging_table_id}` as source
-on
-    {on_condition}
-{matched_clause}
-when not matched then
-    insert (
-        {insert_columns}
-    )
-    values (
-        {insert_values}
-    )
+create or replace table
+    `{target.bq_table_id}`
+as
+select
+        {select_columns}
+from
+    `{target.bq_staging_table_id}`
 """
 
     query_job = bq_client.query(sql)
@@ -753,86 +760,211 @@ def sync_target(drive_service, bucket, target: SyncTarget) -> Dict[str, Any]:
     state = load_state(bucket, target.state_blob)
     files = list_tsv_files(drive_service, target)
 
-    transferred = []
-    skipped = []
-    failed = []
-    invalid = []
-    pending_state_updates = {}
-    target_error = None
-
-    for file_meta in files:
-        file_id = file_meta["id"]
-        file_name = file_meta["name"]
-
-        try:
-            if not should_transfer(file_meta, state):
-                skipped.append(file_name)
-                continue
-
-            data = download_drive_file(drive_service, file_id)
-            validation_result = validate_tsv_file(target, file_meta, data)
-            if not validation_result["valid"]:
-                invalid.append(validation_result)
-                notify_invalid_tsv(target, validation_result)
-                continue
-
-            gcs_path = upload_to_gcs(bucket, target, file_name, data)
-
-            pending_state_updates[file_id] = {
-                "name": file_name,
-                "md5Checksum": file_meta.get("md5Checksum"),
-                "modifiedTime": file_meta.get("modifiedTime"),
-                "size": file_meta.get("size"),
-                "gcsPath": f"gs://{GCS_BUCKET}/{gcs_path}",
-            }
-
-            transferred.append(file_name)
-
-        except Exception as e:
-            failed.append({
-                "name": file_name,
-                "id": file_id,
-                "error": str(e),
-            })
-
-    if transferred:
-        try:
-            bq_result = load_latest_tsv_to_bq(bucket, target)
-            state.update(pending_state_updates)
-            save_state(bucket, target.state_blob, state)
-        except Exception as e:
-            target_error = f"BigQuery load failed: {e}"
-            bq_result = {
+    selected_file, file_timestamp = select_latest_drive_file(files)
+    if selected_file is None:
+        state["last_attempt"] = attempt_payload(
+            "skipped",
+            reason="No matching timestamped TSV files found in Drive folder.",
+        )
+        save_state(bucket, target.state_blob, state)
+        return {
+            "target": target.name,
+            "folder_id": target.folder_id,
+            "file_name_pattern": target.file_name_pattern,
+            "gcs_prefix": target.gcs_prefix,
+            "state_blob": target.state_blob,
+            "detected": len(files),
+            "selected_file": None,
+            "transferred": 0,
+            "skipped": 1,
+            "failed": 0,
+            "invalid": 0,
+            "transferred_files": [],
+            "failed_files": [],
+            "invalid_files": [],
+            "bigquery": {
                 "loaded": False,
-                "error": str(e),
-            }
-    else:
-        bq_result = {
-            "loaded": False,
-            "reason": "No transferred files. BigQuery load skipped.",
+                "reason": "No matching timestamped TSV files found in Drive folder.",
+            },
         }
 
-    result = {
-        "target": target.name,
-        "folder_id": target.folder_id,
-        "file_name_pattern": target.file_name_pattern,
-        "gcs_prefix": target.gcs_prefix,
-        "state_blob": target.state_blob,
-        "detected": len(files),
-        "transferred": len(transferred),
-        "skipped": len(skipped),
-        "failed": len(failed),
-        "invalid": len(invalid),
-        "transferred_files": transferred,
-        "failed_files": failed,
-        "invalid_files": invalid,
-        "bigquery": bq_result,
-    }
+    file_id = selected_file["id"]
+    file_name = selected_file["name"]
+    log_structured(
+        "DRIVE_FILE_SELECTED",
+        target=target.name,
+        drive_file_id=file_id,
+        file_name=file_name,
+        file_timestamp=file_timestamp,
+        modified_time=selected_file.get("modifiedTime"),
+        size=selected_file.get("size"),
+    )
 
-    if target_error:
-        result["error"] = target_error
+    selected_file_payload = file_state_payload(selected_file, file_timestamp)
 
-    return result
+    if last_success_matches(selected_file, file_timestamp, state):
+        state["last_attempt"] = attempt_payload(
+            "skipped",
+            selected_file,
+            file_timestamp,
+            reason="Latest Drive file already loaded successfully.",
+        )
+        save_state(bucket, target.state_blob, state)
+        return {
+            "target": target.name,
+            "folder_id": target.folder_id,
+            "file_name_pattern": target.file_name_pattern,
+            "gcs_prefix": target.gcs_prefix,
+            "state_blob": target.state_blob,
+            "detected": len(files),
+            "selected_file": selected_file_payload,
+            "transferred": 0,
+            "skipped": 1,
+            "failed": 0,
+            "invalid": 0,
+            "transferred_files": [],
+            "failed_files": [],
+            "invalid_files": [],
+            "bigquery": {
+                "loaded": False,
+                "reason": "Latest Drive file already loaded successfully.",
+            },
+        }
+
+    source_gcs_path = None
+
+    try:
+        data = download_drive_file(drive_service, file_id)
+        validation_result = validate_tsv_file(target, selected_file, data)
+
+        if not validation_result["valid"]:
+            invalid_paths = upload_invalid_tsv(
+                bucket,
+                target,
+                file_name,
+                data,
+                validation_result,
+            )
+            invalid_file = {
+                **validation_result,
+                **invalid_paths,
+            }
+            notify_invalid_tsv(target, invalid_file)
+            state["last_attempt"] = attempt_payload(
+                "invalid",
+                selected_file,
+                file_timestamp,
+                validation_result=validation_result,
+                **invalid_paths,
+            )
+            save_state(bucket, target.state_blob, state)
+            return {
+                "target": target.name,
+                "folder_id": target.folder_id,
+                "file_name_pattern": target.file_name_pattern,
+                "gcs_prefix": target.gcs_prefix,
+                "state_blob": target.state_blob,
+                "detected": len(files),
+                "selected_file": selected_file_payload,
+                "transferred": 0,
+                "skipped": 0,
+                "failed": 0,
+                "invalid": 1,
+                "transferred_files": [],
+                "failed_files": [],
+                "invalid_files": [invalid_file],
+                "bigquery": {
+                    "loaded": False,
+                    "reason": "TSV schema validation failed.",
+                },
+            }
+
+        gcs_path = upload_to_gcs(bucket, target, file_name, data)
+        source_gcs_path = f"gs://{GCS_BUCKET}/{gcs_path}"
+        bq_result = load_tsv_to_bq(target, data, source_gcs_path)
+
+        loaded_at = utc_now_iso()
+        state["last_success"] = file_state_payload(
+            selected_file,
+            file_timestamp,
+            gcs_path=source_gcs_path,
+            loaded_at=loaded_at,
+        )
+        state["last_attempt"] = attempt_payload(
+            "success",
+            selected_file,
+            file_timestamp,
+            gcs_path=source_gcs_path,
+            loaded_at=loaded_at,
+            bigquery=bq_result,
+        )
+        save_state(bucket, target.state_blob, state)
+
+        log_structured(
+            "SYNC_TARGET_COMPLETED",
+            target=target.name,
+            drive_file_id=file_id,
+            file_name=file_name,
+            file_timestamp=file_timestamp,
+            gcs_path=source_gcs_path,
+            staging_table=target.bq_staging_table_id,
+            target_table=target.bq_table_id,
+            loaded_at=loaded_at,
+        )
+
+        return {
+            "target": target.name,
+            "folder_id": target.folder_id,
+            "file_name_pattern": target.file_name_pattern,
+            "gcs_prefix": target.gcs_prefix,
+            "state_blob": target.state_blob,
+            "detected": len(files),
+            "selected_file": selected_file_payload,
+            "transferred": 1,
+            "skipped": 0,
+            "failed": 0,
+            "invalid": 0,
+            "transferred_files": [file_name],
+            "failed_files": [],
+            "invalid_files": [],
+            "bigquery": bq_result,
+        }
+
+    except Exception as e:
+        failed_file = {
+            "name": file_name,
+            "id": file_id,
+            "error": str(e),
+        }
+        state["last_attempt"] = attempt_payload(
+            "failed",
+            selected_file,
+            file_timestamp,
+            error=str(e),
+            gcs_path=source_gcs_path,
+        )
+        save_state(bucket, target.state_blob, state)
+        return {
+            "target": target.name,
+            "folder_id": target.folder_id,
+            "file_name_pattern": target.file_name_pattern,
+            "gcs_prefix": target.gcs_prefix,
+            "state_blob": target.state_blob,
+            "detected": len(files),
+            "selected_file": selected_file_payload,
+            "transferred": 0,
+            "skipped": 0,
+            "failed": 1,
+            "invalid": 0,
+            "transferred_files": [],
+            "failed_files": [failed_file],
+            "invalid_files": [],
+            "bigquery": {
+                "loaded": False,
+                "error": str(e),
+            },
+            "error": str(e),
+        }
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -879,6 +1011,7 @@ def run_sync():
 
     if len(target_results) == 1:
         target_result = target_results[0]
+        result["selected_file"] = target_result.get("selected_file")
         result["transferred_files"] = target_result.get("transferred_files", [])
         result["failed_files"] = target_result.get("failed_files", [])
         result["invalid_files"] = target_result.get("invalid_files", [])

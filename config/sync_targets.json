@@ -5,7 +5,7 @@
       "folder_id": "1o5OHFPUxxzjSLg3JkDPHK_SbA6Q2Dl6q",
       "file_name_pattern": "^top_banner_tsv_download_\\d{14}\\.tsv$",
       "gcs_prefix": "drive-tsv/top_banner_tsv/",
-      "state_blob": "state/state.json",
+      "state_blob": "state/top_banner_tsv.json",
       "bq_dataset": "ice_magapocke_source",
       "bq_table": "top_banner_tsv",
       "bq_staging_table": "top_banner_tsv_stg",
@@ -14,9 +14,6 @@
         "header_row_index": 1,
         "notify_on_invalid": true
       },
-      "merge_keys": [
-        "id"
-      ],
       "bq_schema": [
         {
           "name": "command",
