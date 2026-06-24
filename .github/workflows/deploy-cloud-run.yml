@@ -39,6 +39,10 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Prepare deploy metadata
+        run: |
+          echo "DEPLOYED_AT=$(date -u +'%Y%m%d%H%M%S')" >> "${GITHUB_ENV}"
+
       - name: Build image
         run: |
           gcloud builds submit \
@@ -52,6 +56,15 @@ jobs:
             --region "${REGION}" \
             --image "${IMAGE_BASE}:${GITHUB_SHA}" \
             --service-account "${RUNTIME_SERVICE_ACCOUNT}" \
+            --update-env-vars "DEPLOYED_AT=${DEPLOYED_AT}" \
+            --quiet
+
+      - name: Route traffic to latest revision
+        run: |
+          gcloud run services update-traffic "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --to-latest \
             --quiet
 
       - name: Verify deployed revision
@@ -59,4 +72,4 @@ jobs:
           gcloud run services describe "${SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
-            --format='value(status.latestReadyRevisionName,status.url)'
+            --format='yaml(status.latestReadyRevisionName,status.traffic,spec.traffic)'
