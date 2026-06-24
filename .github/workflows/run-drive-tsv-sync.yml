@@ -20,6 +20,7 @@ env:
   PROJECT_ID: ice-magapocke-project
   REGION: asia-northeast1
   SERVICE: drive-tsv-sync
+  SERVICE_URL: https://drive-tsv-sync-hqdafcjaya-an.a.run.app
   STATE_PATH: gs://drive-tsv/state/top_banner_tsv.json
 
 jobs:
@@ -32,10 +33,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Authenticate to Google Cloud
+        id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ env.SERVICE_URL }}
 
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v2
@@ -43,16 +47,19 @@ jobs:
       - name: Invoke sync endpoint
         id: invoke
         run: |
-          SERVICE_URL=$(gcloud run services describe "${SERVICE}" \
+          RESOLVED_SERVICE_URL=$(gcloud run services describe "${SERVICE}" \
             --project "${PROJECT_ID}" \
             --region "${REGION}" \
             --format='value(status.url)')
 
-          TOKEN=$(gcloud auth print-identity-token --audiences="${SERVICE_URL}")
+          if [ "${RESOLVED_SERVICE_URL}" != "${SERVICE_URL}" ]; then
+            echo "Cloud Run service URL mismatch: ${RESOLVED_SERVICE_URL} != ${SERVICE_URL}" >&2
+            exit 1
+          fi
 
           curl --fail-with-body --show-error --silent \
             --request POST \
-            --header "Authorization: Bearer ${TOKEN}" \
+            --header "Authorization: Bearer ${{ steps.auth.outputs.id_token }}" \
             --header "Content-Type: application/json" \
             "${SERVICE_URL}" | tee sync-result.json
 
