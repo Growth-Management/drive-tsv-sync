@@ -44,6 +44,7 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v2
 
+      # Keep the Cloud Run URL fixed so the ID token audience matches the service.
       - name: Invoke sync endpoint
         id: invoke
         run: |
