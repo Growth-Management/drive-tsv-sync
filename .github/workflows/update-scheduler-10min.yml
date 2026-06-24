@@ -61,14 +61,14 @@ jobs:
             --location "${REGION}" \
             --format=json > scheduler-jobs.json
 
-          JOB_COUNT=$(jq --arg url "${SERVICE_URL}" '[.[] | select(.httpTarget.uri == $url)] | length' scheduler-jobs.json)
+          JOB_COUNT=$(jq --arg url "${SERVICE_URL}" '[.[] | select((.httpTarget.uri | rtrimstr("/")) == $url)] | length' scheduler-jobs.json)
           if [ "${JOB_COUNT}" != "1" ]; then
             echo "Expected exactly one Cloud Scheduler job targeting ${SERVICE_URL}, found ${JOB_COUNT}." >&2
-            jq --arg url "${SERVICE_URL}" '[.[] | {name, schedule, timeZone, uri: .httpTarget.uri}]' scheduler-jobs.json >&2
+            jq '[.[] | {name, schedule, timeZone, uri: .httpTarget.uri}]' scheduler-jobs.json >&2
             exit 1
           fi
 
-          JOB_NAME=$(jq -r --arg url "${SERVICE_URL}" '.[] | select(.httpTarget.uri == $url) | .name | split("/")[-1]' scheduler-jobs.json)
+          JOB_NAME=$(jq -r --arg url "${SERVICE_URL}" '.[] | select((.httpTarget.uri | rtrimstr("/")) == $url) | .name | split("/")[-1]' scheduler-jobs.json)
           echo "Updating Cloud Scheduler job: ${JOB_NAME}"
 
           gcloud scheduler jobs update http "${JOB_NAME}" \
