@@ -1,0 +1,83 @@
+name: Update Cloud Scheduler to 10min Once
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/update-scheduler-10min.yml
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: update-drive-tsv-scheduler
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ice-magapocke-project
+  REGION: asia-northeast1
+  SERVICE: drive-tsv-sync
+  SERVICE_URL: https://drive-tsv-sync-hqdafcjaya-an.a.run.app
+  NEW_SCHEDULE: "*/10 * * * *"
+  TIME_ZONE: Asia/Tokyo
+
+jobs:
+  update-scheduler:
+    name: Update Cloud Scheduler cadence
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Update scheduler job
+        run: |
+          set -euo pipefail
+
+          RESOLVED_SERVICE_URL=$(gcloud run services describe "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --format='value(status.url)')
+
+          if [ "${RESOLVED_SERVICE_URL}" != "${SERVICE_URL}" ]; then
+            echo "Cloud Run service URL mismatch: ${RESOLVED_SERVICE_URL} != ${SERVICE_URL}" >&2
+            exit 1
+          fi
+
+          gcloud scheduler jobs list \
+            --project "${PROJECT_ID}" \
+            --location "${REGION}" \
+            --format=json > scheduler-jobs.json
+
+          JOB_COUNT=$(jq --arg url "${SERVICE_URL}" '[.[] | select(.httpTarget.uri == $url)] | length' scheduler-jobs.json)
+          if [ "${JOB_COUNT}" != "1" ]; then
+            echo "Expected exactly one Cloud Scheduler job targeting ${SERVICE_URL}, found ${JOB_COUNT}." >&2
+            jq --arg url "${SERVICE_URL}" '[.[] | {name, schedule, timeZone, uri: .httpTarget.uri}]' scheduler-jobs.json >&2
+            exit 1
+          fi
+
+          JOB_NAME=$(jq -r --arg url "${SERVICE_URL}" '.[] | select(.httpTarget.uri == $url) | .name | split("/")[-1]' scheduler-jobs.json)
+          echo "Updating Cloud Scheduler job: ${JOB_NAME}"
+
+          gcloud scheduler jobs update http "${JOB_NAME}" \
+            --project "${PROJECT_ID}" \
+            --location "${REGION}" \
+            --schedule "${NEW_SCHEDULE}" \
+            --time-zone "${TIME_ZONE}"
+
+          gcloud scheduler jobs describe "${JOB_NAME}" \
+            --project "${PROJECT_ID}" \
+            --location "${REGION}" \
+            --format='yaml(name,schedule,timeZone,httpTarget.uri,state,lastAttemptTime)'
