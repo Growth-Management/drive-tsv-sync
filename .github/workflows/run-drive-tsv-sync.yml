@@ -1,0 +1,62 @@
+name: Run Drive TSV Sync
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/run-drive-tsv-sync.yml
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: run-drive-tsv-sync
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ice-magapocke-project
+  REGION: asia-northeast1
+  SERVICE: drive-tsv-sync
+  STATE_PATH: gs://drive-tsv/state/top_banner_tsv.json
+
+jobs:
+  run-sync:
+    name: Invoke Cloud Run sync
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Invoke sync endpoint
+        id: invoke
+        run: |
+          SERVICE_URL=$(gcloud run services describe "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --format='value(status.url)')
+
+          TOKEN=$(gcloud auth print-identity-token --audiences="${SERVICE_URL}")
+
+          curl --fail-with-body --show-error --silent \
+            --request POST \
+            --header "Authorization: Bearer ${TOKEN}" \
+            --header "Content-Type: application/json" \
+            "${SERVICE_URL}" | tee sync-result.json
+
+      - name: Show top_banner_tsv state
+        if: always()
+        run: |
+          gcloud storage cat "${STATE_PATH}" || true
